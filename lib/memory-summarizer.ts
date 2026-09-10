@@ -16,7 +16,7 @@ import {
     incrementCoreMemoryCounter,
 } from "./memory-storage";
 import { resolveAuxiliaryApiConfig } from "./settings-storage";
-import { loadNativeTimeline, formatTimelineForSummarization } from "./short-term-assembler";
+import { loadNativeTimeline, formatTimelineForSummarization, filterTimelineByAllowedSources } from "./short-term-assembler";
 import { generateEmbedding, resolveEmbeddingModel } from "./memory-embedding";
 import { simpleLLMCall } from "./api-helpers";
 import { maybeRunCoreMemoryPipeline } from "./core-memory-builder";
@@ -57,7 +57,11 @@ export async function maybeRunSummarization(
 export async function runSummarizationPipeline(
     characterId: string,
     characterName: string,
-    options?: { force?: boolean }
+    options?: {
+        force?: boolean;
+        /** 手动指定总结起点（覆盖进度水位线）；force 为真时忽略 */
+        sinceTimestamp?: string;
+    }
 ): Promise<{ success: boolean; error?: string }> {
     const config = loadMemoryConfig();
 
@@ -68,8 +72,16 @@ export async function runSummarizationPipeline(
     }
 
     // Read native app data (chat messages, moments) directly — no separate event log
-    const afterTimestamp = options?.force ? undefined : (getLastSummarizedTimestamp(characterId) ?? undefined);
-    const allEntries = loadNativeTimeline(characterId, afterTimestamp ? { afterTimestamp } : undefined);
+    const afterTimestamp = options?.force
+        ? undefined
+        : options?.sinceTimestamp ?? (getLastSummarizedTimestamp(characterId) ?? undefined);
+    // 记忆来源开关同样作用于长期总结：被关掉的来源不进总结素材。
+    // 进度水位线取「过滤后」最后一条的时间，因此关掉的来源不会把水位线推过头，
+    // 但已被水位线越过的内容重新打开后也不会回补——这一点在设置里已注明。
+    const allEntries = filterTimelineByAllowedSources(
+        loadNativeTimeline(characterId, afterTimestamp ? { afterTimestamp } : undefined),
+        config.shortTermAllowedSources,
+    );
 
     if (allEntries.length < 4) {
         if (!options?.force) resetEventCounter(characterId);
@@ -90,10 +102,11 @@ export async function runSummarizationPipeline(
         .replace(/\{\{events\}\}/gi, eventsText);
 
     // Call LLM for summarization — compatible with all providers
+    // label 用于在「底层调用大模型日志」中标识这是记忆总结调用
     const result = await simpleLLMCall(
         apiConfig,
         [{ role: "user", content: summaryPrompt }],
-        { temperature: 0.3 },
+        { temperature: 0.3, label: `记忆总结·${characterName}` },
     );
 
     if (!result.content) {

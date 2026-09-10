@@ -6,7 +6,9 @@ import {
     determineBaseUrl,
     isNativeAnthropicApi,
     isNativeGoogleApi,
+    stripHallucinatedTimestamps,
 } from "./api-helpers";
+import { resolveEnabledGenerationParameters } from "./generation-parameters";
 
 export type LlmProviderKind = "openai-compatible" | "anthropic" | "gemini";
 export type NativeToolProtocol = "openai-compatible" | "anthropic" | "gemini";
@@ -37,6 +39,8 @@ export type LlmRequestPayload = {
     body: Record<string, unknown>;
     providerKind: LlmProviderKind;
     messagesForLog: { role: string; content: string | LLMContentPart[]; marker?: string }[];
+    /** 需要经本站 /api/llm-proxy 服务端转发（OpenCode 网关未开放浏览器 CORS 时置 true） */
+    serverProxy?: boolean;
 };
 
 export type LlmParsedResponse = {
@@ -66,6 +70,8 @@ export type LlmToolCallDelta = {
 type ProviderRequestOptions = {
     stream?: boolean;
     tools?: LlmToolDefinition[];
+    /** 单次最大输出 token：按调用覆盖预设值（工坊输出护栏用）。不填则沿用预设/各家默认 */
+    maxTokens?: number;
 };
 
 const ANTHROPIC_AUTO_MAX_TOKENS = 8192;
@@ -196,6 +202,40 @@ function ensureProviderHasUserMessage(messages: LlmRequestMessage[]): LlmRequest
     return messages;
 }
 
+/**
+ * Anthropic/Gemini 的消息数组不接受 system 角色：开头连续的 system 提取为顶层
+ * system / systemInstruction；插在历史中间的 system（@Depth 注入、系统指令等）
+ * 原位转为 user 角色，保留位置语义，避免被整体挪到最前面。
+ */
+function splitLeadingSystemMessages(messages: LlmRequestMessage[]): { systemText: string; rest: LlmRequestMessage[] } {
+    let leading = 0;
+    while (leading < messages.length && messages[leading].role === "system") leading += 1;
+    const systemText = messages.slice(0, leading)
+        .map((message) => textFromContent(message.content))
+        .filter(Boolean)
+        .join("\n\n");
+    const rest = messages.slice(leading).map((message) => message.role === "system"
+        ? {
+            role: "user" as const,
+            content: message.content,
+            marker: message.marker ? `${message.marker} | protocol:user-from-system` : "protocol:user-from-system",
+        }
+        : message);
+    return { systemText, rest };
+}
+
+/** 把 multipart content 里的图片 part 压平成文本占位（图像识别未启用时使用）。 */
+function stripVisionParts(messages: LlmRequestMessage[]): LlmRequestMessage[] {
+    return messages.map((message) => {
+        if (!Array.isArray(message.content)) return message;
+        const text = message.content
+            .map((part) => part.type === "text" ? part.text : "[图片]")
+            .filter(Boolean)
+            .join("\n");
+        return { ...message, content: text };
+    });
+}
+
 export function buildProviderRequest(
     config: ApiConfig,
     preset: PresetConfig | null,
@@ -213,7 +253,10 @@ export function buildProviderRequest(
         throw new Error("当前 API 配置未启用原生工具调用。");
     }
 
-    const providerMessages = ensureProviderHasUserMessage(normalizeNativeToolMessageAdjacency(messages));
+    // 图像识别关闭时的总闸：无论哪条路径塞入了 image_url part，一律降级为
+    // "[图片]" 文本，避免不支持视觉的模型（如 DeepSeek）收到 multipart 返回 400。
+    const guardedMessages = config.enableImageRecognition === true ? messages : stripVisionParts(messages);
+    const providerMessages = ensureProviderHasUserMessage(normalizeNativeToolMessageAdjacency(guardedMessages));
 
     if (providerKind === "anthropic") {
         return buildAnthropicRequest(config, preset, baseUrl, providerMessages, options);
@@ -224,11 +267,9 @@ export function buildProviderRequest(
     return buildOpenAICompatibleRequest(config, preset, baseUrl, providerMessages, options);
 }
 
-export function stripHallucinatedTimestamps(text: string): string {
-    return text
-        .replace(/\(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\)\s*/g, "")
-        .replace(/\(system\s*time\s*[:：][^)]*\)\s*/gi, "");
-}
+// 剥离逻辑收敛到 api-helpers（更底层，微信助手运行时也照抄同一份正则）；
+// 这里保留同名再导出，调用方无需改动。
+export { stripHallucinatedTimestamps };
 
 export function buildProviderDebugMessages(
     config: ApiConfig,
@@ -254,19 +295,19 @@ export function parseProviderStreamDelta(providerKind: LlmProviderKind, data: un
 }
 
 function buildSamplingBody(preset: PresetConfig | null): Record<string, unknown> {
-    const body: Record<string, unknown> = {
-        temperature: preset?.temperature ?? 0.8,
-        top_p: preset?.top_p ?? 1.0,
-        frequency_penalty: preset?.frequency_penalty ?? 0,
-        presence_penalty: preset?.presence_penalty ?? 0,
-    };
-    if (preset?.openai_max_tokens && preset.openai_max_tokens > 0) body.max_tokens = preset.openai_max_tokens;
-    if (preset?.repetition_penalty !== undefined && preset.repetition_penalty !== 1) {
-        body.repetition_penalty = preset.repetition_penalty;
+    const enabled = resolveEnabledGenerationParameters(preset);
+    const body: Record<string, unknown> = {};
+    if (enabled.has("temperature")) body.temperature = preset?.temperature ?? 0.8;
+    if (enabled.has("top_p")) body.top_p = preset?.top_p ?? 1.0;
+    if (enabled.has("frequency_penalty")) body.frequency_penalty = preset?.frequency_penalty ?? 0;
+    if (enabled.has("presence_penalty")) body.presence_penalty = preset?.presence_penalty ?? 0;
+    if (enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0) {
+        body.max_tokens = preset.openai_max_tokens;
     }
-    if (preset?.top_k && preset.top_k > 0) body.top_k = preset.top_k;
-    if (preset?.min_p && preset.min_p > 0) body.min_p = preset.min_p;
-    if (preset?.top_a && preset.top_a > 0) body.top_a = preset.top_a;
+    if (enabled.has("repetition_penalty")) body.repetition_penalty = preset?.repetition_penalty ?? 1;
+    if (enabled.has("top_k")) body.top_k = preset?.top_k ?? 0;
+    if (enabled.has("min_p")) body.min_p = preset?.min_p ?? 0;
+    if (enabled.has("top_a")) body.top_a = preset?.top_a ?? 0;
     return body;
 }
 
@@ -481,6 +522,13 @@ function buildOpenAICompatibleRequest(
         }),
         ...buildSamplingBody(preset),
     };
+    if (
+        options.maxTokens
+        && options.maxTokens > 0
+        && (!preset?.enabled_generation_parameters || resolveEnabledGenerationParameters(preset).has("max_tokens"))
+    ) {
+        body.max_tokens = Math.floor(options.maxTokens);
+    }
     if (options.stream) body.stream = true;
     if (options.tools?.length) {
         body.tools = options.tools.map((tool) => ({
@@ -518,20 +566,21 @@ function buildAnthropicRequest(
     messages: LlmRequestMessage[],
     options: ProviderRequestOptions,
 ): LlmRequestPayload {
-    const system = messages
-        .filter((message) => message.role === "system")
-        .map((message) => textFromContent(message.content))
-        .filter(Boolean)
-        .join("\n\n");
-    const bodyMessages = compactAnthropicMessages(messages.filter((message) => message.role !== "system"));
+    const { systemText: system, rest } = splitLeadingSystemMessages(messages);
+    const bodyMessages = compactAnthropicMessages(rest);
+    const enabled = resolveEnabledGenerationParameters(preset);
     const body: Record<string, unknown> = {
         model: config.defaultModel,
         messages: bodyMessages,
-        temperature: preset?.temperature ?? 0.8,
-        max_tokens: preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? preset.openai_max_tokens : ANTHROPIC_AUTO_MAX_TOKENS,
+        max_tokens: options.maxTokens && options.maxTokens > 0
+            ? Math.floor(options.maxTokens)
+            : enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0
+                ? preset.openai_max_tokens
+                : ANTHROPIC_AUTO_MAX_TOKENS,
     };
-    if (preset?.top_p !== undefined) body.top_p = preset.top_p;
-    if (preset?.top_k && preset.top_k > 0) body.top_k = preset.top_k;
+    if (enabled.has("temperature")) body.temperature = preset?.temperature ?? 0.8;
+    if (preset && enabled.has("top_p")) body.top_p = preset.top_p ?? 1;
+    if (enabled.has("top_k")) body.top_k = preset?.top_k ?? 0;
     if (system) body.system = system;
     if (options.stream) body.stream = true;
     if (options.tools?.length) {
@@ -587,21 +636,25 @@ function buildGeminiRequest(
     messages: LlmRequestMessage[],
     options: ProviderRequestOptions,
 ): LlmRequestPayload {
-    const systemText = messages
-        .filter((message) => message.role === "system")
-        .map((message) => textFromContent(message.content))
-        .filter(Boolean)
-        .join("\n\n");
+    const { systemText, rest } = splitLeadingSystemMessages(messages);
     const headers = buildRequestHeaders(config, baseUrl);
     delete headers.Authorization;
+    const enabled = resolveEnabledGenerationParameters(preset);
+    const generationConfig: Record<string, unknown> = {};
+    if (enabled.has("temperature")) generationConfig.temperature = preset?.temperature ?? 0.8;
+    if (enabled.has("top_p")) generationConfig.topP = preset?.top_p ?? 1;
+    if (enabled.has("top_k")) generationConfig.topK = preset?.top_k ?? 0;
+    if (
+        options.maxTokens
+        && options.maxTokens > 0
+        && (!preset?.enabled_generation_parameters || enabled.has("max_tokens"))
+    ) {
+        generationConfig.maxOutputTokens = Math.floor(options.maxTokens);
+    } else if (enabled.has("max_tokens") && preset?.openai_max_tokens && preset.openai_max_tokens > 0) {
+        generationConfig.maxOutputTokens = preset.openai_max_tokens;
+    }
     const body: Record<string, unknown> = {
-        contents: compactGeminiContents(messages.filter((message) => message.role !== "system")),
-        generationConfig: {
-            temperature: preset?.temperature ?? 0.8,
-            topP: preset?.top_p ?? 1,
-            ...(preset?.top_k && preset.top_k > 0 ? { topK: preset.top_k } : {}),
-            ...(preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? { maxOutputTokens: preset.openai_max_tokens } : {}),
-        },
+        contents: compactGeminiContents(rest),
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -609,6 +662,7 @@ function buildGeminiRequest(
             { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
         ],
     };
+    if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
     if (systemText) body.systemInstruction = { parts: [{ text: systemText }] };
     if (options.tools?.length) {
         body.tools = [{

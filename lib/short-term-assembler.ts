@@ -9,6 +9,7 @@ import { loadMomentPosts, loadMomentComments } from "./moments-storage";
 import { loadCharacters } from "./character-storage";
 import { resolveUserIdentity } from "./settings-storage";
 import { loadMemoryConfig } from "./memory-storage";
+import type { MemoryConfig } from "./memory-types";
 import { estimateTokens } from "./token-counter";
 import { loadStoryProjectionEntries } from "./story-storage";
 import { buildTwoLevelMomentThreads } from "./moments-comment-threading";
@@ -108,10 +109,8 @@ function isPromptHiddenChatMessage(
     msg: Pick<ChatMessage, "mediaType" | "nativeToolResult" | "nativeToolCalls">,
     options?: { includeNativeToolHistory?: boolean },
 ): boolean {
-    // 文本协议的工具往返（persistHiddenToolResult / persistHiddenAssistantToolTurn
-    // 存的纯文本 tool_result，无 nativeToolResult 字段）必须回传——它们被持久化
-    // 的目的就是 "for future LLM context"。只有原生工具轮的结构化残留才按
-    // includeNativeToolHistory 开关控制。
+    // 文本协议的 tool_call / tool_result 是正常上下文。只有原生工具轮的
+    // 结构化残留按 includeNativeToolHistory 开关控制。
     return (msg.nativeToolCalls?.length && !options?.includeNativeToolHistory)
         || (msg.mediaType === "tool_result" && !!msg.nativeToolResult && !options?.includeNativeToolHistory)
         || msg.mediaType === "tool_notice"
@@ -193,6 +192,7 @@ export function loadNativeTimeline(
 
             let sender: string;
             if (msg.role === "user") sender = userName;
+            else if (msg.role === "tool") sender = "工具";
             else if (isSystemInstructionMessage(msg)) sender = "系统指令";
             else if (msg.role === "system") continue; // skip system messages in group timeline
             else sender = msg.senderName || "未知";
@@ -319,7 +319,7 @@ export function loadNativeTimeline(
                 continue;
             }
 
-            const sender = msg.role === "user" ? userName : charName;
+            const sender = msg.role === "user" ? userName : msg.role === "tool" ? "工具" : charName;
             let content = stripStateAndInnerForPrompt(msg.content || "");
 
             // Action notifications: always override content to bracket format (stored content is natural language for UI)
@@ -425,7 +425,8 @@ export function loadNativeTimeline(
         // Build post line
         const postLabel = formatPromptEventLabel("朋友圈", post.createdAt, timeAware, timestampOptions);
         const locationPart = post.location ? ` 📍${post.location}` : "";
-        const photoPart = post.photoDescription ? `，[照片:不使用参考图:${post.photoDescription}]` : "";
+        const photoMode = post.photoUseReferenceImage === true ? "使用参考图" : "不使用参考图";
+        const photoPart = post.photoDescription ? `，[照片:${photoMode}:${post.photoDescription}]` : "";
         const lines: string[] = [
             `${postLabel} ${authorName}发了一条动态："${post.content}"${photoPart}${locationPart}`,
         ];
@@ -885,6 +886,29 @@ function truncateTimelineByTokenBudget(
 }
 
 /**
+ * Drop timeline entries whose source app the user has switched off in
+ * 记忆来源 settings. Applies to every consumer of the timeline — the
+ * short-term context assembler as well as long-term summarization.
+ */
+export function filterTimelineByAllowedSources(
+    entries: NativeTimelineEntry[],
+    allowed?: MemoryConfig["shortTermAllowedSources"],
+): NativeTimelineEntry[] {
+    const rules = allowed ?? loadMemoryConfig().shortTermAllowedSources ?? {};
+    return entries.filter(entry => {
+        const source = entry.sourceApp;
+        if (source === "chat") {
+            if (entry.sourceDetail === "group") return rules.group_chat !== false;
+            return rules.chat !== false;
+        }
+        if (source === "story") return rules.story !== false;
+        if (source === "vn") return rules.vn !== false;
+        if (source === "map") return rules.adventure !== false;
+        return (rules as Record<string, boolean | undefined>)[source] !== false;
+    });
+}
+
+/**
  * Unified interface for all modules to get short-term memory context.
  *
  * Returns `RecentBlock[]` + `truncatedHistory`.
@@ -914,17 +938,19 @@ export function prepareShortTermContext(
     unifiedRecentItems: UnifiedRecentItem[];
 } {
     const timeAware = resolvePromptTimeAware(options?.timeAware);
-    const timeline = loadNativeTimeline(characterId, {
+    let timeline = loadNativeTimeline(characterId, {
         userName: options?.userName,
         appId: appId as import("./settings-types").ContentAppId,
         excludeOfflineSessionId: options?.excludeOfflineSessionId,
         timeAware,
         promptTimestampOptions: options?.promptTimestampOptions,
     });
-    // Activation context: full timeline for keyword matching (not truncated)
-    const wbActivationContext = timeline.slice(-10).map(e => e.content).join("\n");
 
     const memConfig = loadMemoryConfig();
+    timeline = filterTimelineByAllowedSources(timeline, memConfig.shortTermAllowedSources);
+
+    // Activation context: full timeline for keyword matching (not truncated)
+    const wbActivationContext = timeline.slice(-10).map(e => e.content).join("\n");
     const budget = memConfig.shortTermTokenBudget;
     const currentTag = getFeatureTag(appId);
     const history = options?.history ?? [];
@@ -1170,15 +1196,18 @@ export function prepareGroupShortTermContext(
     const uniqueCharacterIds = [...new Set(characterIds)];
     const timelineByKey = new Map<string, NativeTimelineEntry>();
     const timeAware = resolvePromptTimeAware(options?.timeAware);
+    const memConfig = loadMemoryConfig();
+    const allowed = memConfig.shortTermAllowedSources ?? {};
 
     for (const characterId of uniqueCharacterIds) {
-        const timeline = loadNativeTimeline(characterId, {
+        let timeline = loadNativeTimeline(characterId, {
             userName: options?.userName,
             appId: "group_chat",
             excludeOfflineSessionId: options?.excludeOfflineSessionId,
             timeAware,
             promptTimestampOptions: options?.promptTimestampOptions,
         });
+        timeline = filterTimelineByAllowedSources(timeline, allowed);
         for (const entry of timeline) {
             if (entry.sourceApp === "chat" && entry.sourceDetail === "group" && entry.groupSessionId === options?.excludeGroupSessionId) {
                 continue;
@@ -1194,7 +1223,6 @@ export function prepareGroupShortTermContext(
     ].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     const wbActivationContext = activationPool.slice(-10).map(item => item.content).join("\n");
 
-    const memConfig = loadMemoryConfig();
     const budget = memConfig.shortTermTokenBudget;
 
     const raw: { tag: string; order: number; entries: NativeTimelineEntry[] }[] = [];

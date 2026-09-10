@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, type CSSProperties } from "react";
-import { Trash2, Zap, Clock, Users, Archive, AlertCircle, Search, Brain, FileText, MoreHorizontal, Plus, Edit3, X, Check, type LucideIcon } from "lucide-react";
+import { Component, useState, useEffect, useCallback, type CSSProperties, type ReactNode } from "react";
+import { Trash2, Zap, Clock, Users, Archive, AlertCircle, Search, Brain, FileText, MoreHorizontal, Plus, Edit3, X, Check, ChevronRight, Filter, type LucideIcon } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/modal";
 import { MemoryTimeline } from "./memory-timeline";
 import { Toggle } from "@/components/ui/form";
@@ -45,6 +45,52 @@ const MEMORY_TOKEN_BUDGET_STEP: Record<MemoryBudgetKey, number> = {
     longTermTokenBudget: 1000,
 };
 const MANUAL_MEMORY_CONTENT_LIMIT = 3000;
+// 详情页时间线最多解析渲染的条数：全量历史可能有几万条，
+// 一次性解析+渲染会把 iOS Safari 的单页内存顶爆（灰屏杀页）
+const MEMORY_TIMELINE_ENTRY_CAP = 2000;
+
+/** 详情页兜底：时间线渲染抛错时显示提示，而不是整页白屏 */
+class MemoryDetailBoundary extends Component<{ children?: ReactNode }, { failed: boolean }> {
+    state = { failed: false };
+    static getDerivedStateFromError() { return { failed: true }; }
+    render() {
+        if (this.state.failed) {
+            return <p className="text-center ts-14 mt-10 text-secondary">这一页加载出错了，返回上一页再试一次。</p>;
+        }
+        return this.props.children;
+    }
+}
+
+type SummarizeRange = "auto" | "all" | number;
+
+const SUMMARIZE_RANGE_OPTIONS: Array<{ value: SummarizeRange; label: string; desc?: string }> = [
+    { value: "auto", label: "接着上次总结", desc: "默认方式，从上次进度继续" },
+    { value: 1, label: "最近 1 天" },
+    { value: 3, label: "最近 3 天" },
+    { value: 7, label: "最近 7 天" },
+    { value: 14, label: "最近 14 天" },
+    { value: 30, label: "最近 30 天" },
+    { value: "all", label: "全部历史" },
+];
+
+type MemorySourceKey = keyof NonNullable<MemoryConfig["shortTermAllowedSources"]>;
+
+/** 记忆来源开关：同时作用于短期上下文与长期总结 */
+const MEMORY_SOURCE_OPTIONS: Array<{ key: MemorySourceKey; label: string }> = [
+    { key: "chat", label: "私聊上下文" },
+    { key: "group_chat", label: "群聊上下文" },
+    { key: "moments", label: "朋友圈" },
+    { key: "checkphone", label: "查手机" },
+    { key: "diary", label: "手记便签" },
+    { key: "xiaohongshu", label: "小红书" },
+    { key: "interview_magazine", label: "在场访谈" },
+    { key: "cocreate", label: "共创" },
+    { key: "game", label: "内置小游戏" },
+    { key: "story", label: "剧情小剧场" },
+    { key: "vn", label: "漫卷" },
+    { key: "adventure", label: "地图冒险" },
+    { key: "custom_app", label: "自定义应用" },
+];
 
 type MemoryEditorState = {
     type: MemoryEntry["type"];
@@ -157,13 +203,18 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
     const [entryMenuId, setEntryMenuId] = useState<string | null>(null);
     const [memoryEditor, setMemoryEditor] = useState<MemoryEditorState | null>(null);
     const [savingMemory, setSavingMemory] = useState(false);
+    const [summarizeRangeOpen, setSummarizeRangeOpen] = useState(false);
+    const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+
+    const disabledSourceCount = MEMORY_SOURCE_OPTIONS
+        .filter(source => (config.shortTermAllowedSources ?? {})[source.key] === false).length;
 
     // Resolve selected character object from ID
     const selectedChar = selectedCharId
         ? loadCharacters().find(c => c.id === selectedCharId) ?? null
         : null;
 
-    const loadCharacterList = useCallback(async () => {
+    const loadCharacterList = useCallback(async (isCancelled?: () => boolean) => {
         const allChars = loadCharacters();
 
         let charIdsWithMem: string[] = [];
@@ -185,22 +236,35 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
                     getMemoryCountByType(id, "core"),
                 ]);
             } catch { /* ignore */ }
-            const stCount = loadNativeTimeline(id).length;
-            infos.push({ character: char, longTermCount: ltCount, coreCount, shortTermCount: stCount });
+            infos.push({ character: char, longTermCount: ltCount, coreCount, shortTermCount: 0 });
         }
 
         // Remaining characters
         for (const char of allChars) {
             if (seen.has(char.id)) continue;
-            const stCount = loadNativeTimeline(char.id).length;
-            infos.push({ character: char, longTermCount: 0, coreCount: 0, shortTermCount: stCount });
+            infos.push({ character: char, longTermCount: 0, coreCount: 0, shortTermCount: 0 });
         }
 
+        if (isCancelled?.()) return;
         setCharacters(infos);
+
+        // 短期计数逐个异步补齐：loadNativeTimeline 是全量组装，重数据账号
+        // 在循环里同步跑完会长时间卡死主线程、瞬时吃掉大量内存
+        for (const info of infos) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (isCancelled?.()) return;
+            let stCount = 0;
+            try { stCount = loadNativeTimeline(info.character.id).length; } catch { /* ignore */ }
+            if (isCancelled?.()) return;
+            setCharacters(prev => prev.map(item =>
+                item.character.id === info.character.id ? { ...item, shortTermCount: stCount } : item));
+        }
     }, []);
 
     useEffect(() => {
-        loadCharacterList();
+        let cancelled = false;
+        void loadCharacterList(() => cancelled);
+        return () => { cancelled = true; };
     }, [loadCharacterList]);
 
     // Load detail data when entering detail view
@@ -218,8 +282,9 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
             setCoreEntries([]);
             setLongTermEntries([]);
         }
-        // Native timeline is sync (localStorage) — no await needed
-        const timeline = loadNativeTimeline(charId);
+        // Native timeline is sync (localStorage) — no await needed.
+        // 只取最近一段（全量可能几万条），防止解析+渲染把 iOS Safari 内存顶爆
+        const timeline = loadNativeTimeline(charId).slice(-MEMORY_TIMELINE_ENTRY_CAP);
         setShortTermEvents(timeline.filter(e =>
             !(e.sourceApp === "moments" && e.postAuthorType === "user")
             && !(e.sourceApp === "interview_magazine" && e.sourceDetail === "interview_shared_issue")
@@ -273,21 +338,31 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
         onNotice?.(msg);
     };
 
-    const handleManualSummarize = async () => {
+    const handleManualSummarize = async (range: SummarizeRange = "auto") => {
         if (!selectedCharId || summarizing) return;
+        setSummarizeRangeOpen(false);
         setSummarizing(true);
         try {
-            const lastSummarizedAt = getLastSummarizedTimestamp(selectedCharId);
+            const sinceTimestamp = typeof range === "number"
+                ? new Date(Date.now() - range * 86400000).toISOString()
+                : undefined;
+            const afterTimestamp = range === "all"
+                ? undefined
+                : sinceTimestamp ?? getLastSummarizedTimestamp(selectedCharId) ?? undefined;
             const timelineCount = loadNativeTimeline(
                 selectedCharId,
-                lastSummarizedAt ? { afterTimestamp: lastSummarizedAt } : undefined,
+                afterTimestamp ? { afterTimestamp } : undefined,
             ).length;
             if (timelineCount < 4) {
-                showNotice(lastSummarizedAt ? "新事件太少，至少需要 4 条记录" : "数据太少，至少需要 4 条记录");
+                showNotice("所选范围内事件不足 4 条");
                 return;
             }
 
-            const result = await runSummarizationPipeline(selectedCharId, selectedChar?.name ?? "");
+            const result = await runSummarizationPipeline(
+                selectedCharId,
+                selectedChar?.name ?? "",
+                range === "all" ? { force: true } : sinceTimestamp ? { sinceTimestamp } : undefined,
+            );
             if (result.success) {
                 showNotice("总结完成");
                 loadDetailData(selectedCharId);
@@ -597,6 +672,7 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
             <div className="flex flex-col absolute inset-0 overflow-hidden" style={{ padding: "0 16px" }}>
                 {/* Content */}
                 <div className="memory-detail-scroll flex-1 overflow-y-auto flex flex-col gap-2 min-h-0">
+                    <MemoryDetailBoundary>
                     {loading ? (
                         <p className="text-center ts-14 mt-10 text-secondary">
                             加载中...
@@ -627,6 +703,7 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
                         /* ── Long-term: Summarized Memories ── */
                         renderMemoryEntries("long_term", longTermEntries, "暂无长期记忆。点击设置页的手动总结，或直接新增一条记忆。")
                     )}
+                    </MemoryDetailBoundary>
                 </div>
 
                 {/* Bottom tab bar — floating above bottom */}
@@ -761,12 +838,12 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
                                 <MemorySettingsIcon icon={Zap} color={BINDING_ACCENTS.memory} />
                                 <div className="menu-label-group">
                                     <span className="menu-label">长期记忆手动总结</span>
-                                    <span className="menu-desc">将短期记忆整理为长期记忆</span>
+                                    <span className="menu-desc">将新产生的事件整理为长期记忆</span>
                                 </div>
                                 <div className="menu-right">
                                     <button
                                         className="ui-btn ui-btn-outline py-1 px-3 ts-12"
-                                        onClick={handleManualSummarize}
+                                        onClick={() => setSummarizeRangeOpen(true)}
                                         disabled={summarizing}
                                     >
                                         <Zap size={12} className="mr-1" />
@@ -792,8 +869,92 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
                                 </div>
                             </div>
                         </div>
+
+                        {summarizeRangeOpen ? (
+                            <div className="modal-overlay modal-overlay-bottom" data-ui="modal" onClick={() => setSummarizeRangeOpen(false)}>
+                                <div className="modal-sheet" data-ui="modal-sheet" onClick={event => event.stopPropagation()}>
+                                    <div className="modal-header" data-ui="modal-header">
+                                        <button className="modal-header-btn modal-header-btn-muted" onClick={() => setSummarizeRangeOpen(false)}><X size={18} /></button>
+                                        <h3 className="modal-title">选择总结范围</h3>
+                                        <span style={{ width: 44 }} />
+                                    </div>
+                                    <div className="modal-body modal-body-tight" data-ui="modal-body">
+                                        <div className="menu-group">
+                                            {SUMMARIZE_RANGE_OPTIONS.map(option => (
+                                                <button
+                                                    key={String(option.value)}
+                                                    type="button"
+                                                    className="menu-item w-full text-left"
+                                                    onClick={() => void handleManualSummarize(option.value)}
+                                                >
+                                                    <div className="menu-label-group">
+                                                        <span className="menu-label">{option.label}</span>
+                                                        {option.desc ? <span className="menu-desc">{option.desc}</span> : null}
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : null}
                     </>
                 )}
+
+                {/* Memory source filter — one entry row, full picker lives in a bottom sheet */}
+                <p className="menu-group-desc mx-2">记忆来源</p>
+                <div className="menu-group">
+                    <button type="button" className="menu-item" onClick={() => setSourcePickerOpen(true)}>
+                        <MemorySettingsIcon icon={Filter} color={BINDING_ACCENTS.memory} />
+                        <div className="menu-label-group">
+                            <span className="menu-label">记忆来源</span>
+                            <span className="menu-desc">选择哪些内容参与记忆</span>
+                        </div>
+                        <div className="menu-right">
+                            <span className="menu-desc mr-1">{disabledSourceCount === 0 ? "全部开启" : `已关闭 ${disabledSourceCount} 项`}</span>
+                            <ChevronRight size={16} />
+                        </div>
+                    </button>
+                </div>
+
+                {sourcePickerOpen ? (
+                    <div className="modal-overlay modal-overlay-bottom" data-ui="modal" onClick={() => setSourcePickerOpen(false)}>
+                        <div className="modal-sheet memory-source-sheet" data-ui="modal-sheet" onClick={event => event.stopPropagation()}>
+                            <div className="modal-header" data-ui="modal-header">
+                                <span style={{ width: 28 }} />
+                                <h3 className="modal-title">记忆来源</h3>
+                                <button className="modal-header-btn modal-header-btn-muted" onClick={() => setSourcePickerOpen(false)}><X size={18} /></button>
+                            </div>
+                            <div className="modal-body modal-body-tight" data-ui="modal-body">
+                                <div className="memory-source-chips" style={{ "--chip-accent": BINDING_ACCENTS.memory } as CSSProperties}>
+                                    {MEMORY_SOURCE_OPTIONS.map(source => {
+                                        const allowed = config.shortTermAllowedSources ?? {};
+                                        const isChecked = allowed[source.key] !== false;
+                                        return (
+                                            <button
+                                                key={source.key}
+                                                type="button"
+                                                className="memory-source-chip"
+                                                data-off={isChecked ? undefined : ""}
+                                                aria-pressed={isChecked}
+                                                onClick={() => {
+                                                    const next = {
+                                                        ...config,
+                                                        shortTermAllowedSources: { ...allowed, [source.key]: !isChecked },
+                                                    };
+                                                    setConfig(next);
+                                                    saveMemoryConfig(next);
+                                                }}
+                                            >
+                                                {source.label}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                ) : null}
 
                 {/* Feature toggles */}
                 <p className="menu-group-desc mx-2">自动化</p>
@@ -802,7 +963,7 @@ export function MemoryBankPage({ view, selectedCharId, onSelectChar, onNotice }:
                         <MemorySettingsIcon icon={Clock} color={BINDING_ACCENTS.memory} />
                         <div className="menu-label-group">
                             <span className="menu-label">长期记忆自动总结</span>
-                            <span className="menu-desc">每隔一定条数自动整理短期记忆为长期记忆</span>
+                            <span className="menu-desc">每隔一定条数自动将新事件整理为长期记忆</span>
                         </div>
                         <div className="menu-right">
                             <Toggle checked={config.autoSummarizeEnabled ?? true} onChange={(v) => {

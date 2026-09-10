@@ -10,12 +10,14 @@ import {
   writeCustomAppCollection,
 } from "@/lib/custom-app-storage";
 import { formatCustomAppRegistrationRemovalSummary, removeCustomAppRegistrationsAsync } from "@/lib/custom-app-registration";
+import { CustomAppFailurePanel, type CustomAppFailureDetail } from "@/components/app-market/custom-app-failure";
 import { permissionLabelWithContext } from "@/lib/custom-app-permission-labels";
 import { registerCustomAppToolExecutor, type CustomAppToolExecutorPayload } from "@/lib/custom-app-tool-runtime";
 import { updateInstalledCustomAppFromMarket } from "@/lib/custom-app-market-update";
 import { loadCharacters } from "@/lib/character-storage";
 import { hydrateKvDb } from "@/lib/kv-db";
 import { ensureSettingsStorageHydrated } from "@/lib/settings-storage";
+import { getPwaHostedSafeArea, PWA_DISPLAY_MODE_CHANGED_EVENT } from "@/lib/pwa-display-mode";
 import {
   addChatContact,
   CHAT_MESSAGE_PUSHED_EVENT,
@@ -46,6 +48,7 @@ import {
   loadCustomAppTasks,
   markCustomAppNotificationsRead,
   payCustomAppWallet,
+  readCustomAppBridgeState,
   readCustomAppCalendar,
   readCustomAppChatHistory,
   readCustomAppCharacterRelations,
@@ -59,11 +62,14 @@ import {
   readCustomAppVoiceProfiles,
   readCustomAppWorld,
   recognizeCustomAppSpeech,
+  recordCustomAppSpeech,
+  stopCustomAppRecording,
   requestCustomAppReply,
   runCustomAppAiChat,
   runCustomAppAiClassify,
   runCustomAppAiEmbed,
   searchCustomAppMemory,
+  sendCustomAppBridgeOutbox,
   sendCustomAppTextMessage,
   scheduleCustomAppTask,
   sendCustomAppCard,
@@ -78,6 +84,9 @@ import {
   writeCustomAppCharacterState,
   writeCustomAppWorld,
 } from "@/lib/custom-app-host-api";
+import { REALITY_BRIDGE_APP_EVENT_NAME, REALITY_BRIDGE_DATA_EVENT } from "@/lib/reality-bridge/types";
+import { OnlineRoomConnection, onlineCloudApi } from "@/lib/online-room-client";
+import { submitContentReport } from "@/lib/moderation-client";
 
 type CustomAppRunnerProps = {
   app: InstalledCustomApp;
@@ -102,7 +111,6 @@ type CustomAppRunnerProps = {
 
 type BridgeResult = unknown;
 
-const EMPTY_CUSTOM_APP_SRC_DOC = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
 const CUSTOM_APP_BACKGROUND_RUNNER_TIMEOUT_MS = 5 * 60_000;
 
 function normalizeAssetRef(value: string): string {
@@ -155,6 +163,81 @@ html, body { min-height: 100%; }
   var eventHandlers = {};
   var toolHandlers = {};
   var seq = 0;
+
+  // ── 首屏失败上报 ──
+  // 沙盒里的异常既不冒泡到宿主 React，也不显示在界面上，出事就是一片白。
+  // 这里把未捕获异常收集起来，并在首屏后检查有没有真的画出东西，
+  // 没画出来就连同错误一起报给宿主，由宿主弹失败面板。
+  var bootErrors = [];
+  function reportError(text){
+    if (!text) return;
+    var line = String(text).slice(0, 300);
+    if (bootErrors.length < 8 && bootErrors.indexOf(line) < 0) bootErrors.push(line);
+  }
+  // 诊断信息是要粘给别人看的：包内资源都被改写成了 data: URL，原样打出来就是
+  // 一长串 base64 把整段诊断淹掉；外链则可能把 query 里的 token 一起带出去。
+  function briefUrl(raw){
+    var url = String(raw || '');
+    if (url.slice(0, 5) === 'data:') {
+      var meta = url.slice(5);
+      var stop = meta.search(/[;,]/);
+      return 'data:' + (stop > 0 ? meta.slice(0, stop) : meta.slice(0, 24)) + '（包内资源）';
+    }
+    var cut = url.indexOf('?');
+    if (cut > 0) url = url.slice(0, cut);
+    return url.length > 120 ? url.slice(0, 120) + '…' : url;
+  }
+  window.addEventListener('error', function(event){
+    var target = event && event.target;
+    if (target && target !== window && target.tagName) {
+      reportError('资源加载失败：' + briefUrl(target.src || target.href || target.tagName));
+      return;
+    }
+    var err = event && event.error;
+    var where = event && event.lineno ? ' (' + event.lineno + ':' + event.colno + ')' : '';
+    reportError(String((event && event.message) || (err && err.message) || err || 'Unknown error') + where);
+  }, true);
+  window.addEventListener('unhandledrejection', function(event){
+    var reason = event && event.reason;
+    reportError('未处理的 Promise 拒绝：' + String((reason && reason.message) || reason));
+  });
+  // 判「有没有渲染出东西」不能靠 getBoundingClientRect：沙盒 iframe 在某些容器里
+  // 会被跳过布局，元素尺寸全是 0，正常应用也会被误判成白屏。改看 DOM 本身。
+  function ownText(el){
+    var text = '';
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var node = el.childNodes[i];
+      if (node.nodeType === 3) text += node.nodeValue;
+    }
+    return text.replace(/\s+/g, '');
+  }
+  var SKIP_TAGS = { SCRIPT:1, STYLE:1, LINK:1, TEMPLATE:1, META:1, TITLE:1, HEAD:1, NOSCRIPT:1 };
+  var MEDIA_TAGS = { IMG:1, SVG:1, CANVAS:1, VIDEO:1, AUDIO:1, IFRAME:1, INPUT:1, BUTTON:1, TEXTAREA:1, SELECT:1, HR:1 };
+  function renderedSomething(){
+    if (!document.body) return false;
+    var nodes = document.body.querySelectorAll('*');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var tag = String(el.tagName || '').toUpperCase();
+      if (SKIP_TAGS[tag]) continue;
+      if (MEDIA_TAGS[tag]) return true;
+      if (ownText(el)) return true;
+    }
+    return false;
+  }
+  var blankChecks = 0;
+  function checkBlank(){
+    blankChecks += 1;
+    if (renderedSomething()) return;
+    // 首屏还在加载、或应用在等一次异步请求时会短暂为空，连续几次都空才算真白屏
+    if (blankChecks < 4 || document.readyState !== 'complete') {
+      if (blankChecks < 8) setTimeout(checkBlank, 1200);
+      return;
+    }
+    parent.postMessage({ source:'ai-phone-custom-app-frame', type:'app.blank', frameId:frameId, appId:appId, errors: bootErrors.slice(0, 5) }, '*');
+  }
+  setTimeout(checkBlank, 4000);
+
   function request(action, payload){
     var requestId = frameId + '_' + (++seq);
     parent.postMessage({ source:'ai-phone-custom-app-frame', type:'request', frameId:frameId, appId:appId, requestId:requestId, action:action, payload:payload || {} }, '*');
@@ -165,6 +248,20 @@ html, body { min-height: 100%; }
   window.addEventListener('message', function(event){
     var data = event.data || {};
     if (data.source !== 'ai-phone-custom-app-host' || data.frameId !== frameId) return;
+    if (data.type === 'layout.safe-area' && data.safeArea) {
+      var safeArea = data.safeArea;
+      var root = document.documentElement;
+      root.style.setProperty('--ai-phone-app-safe-top', String(safeArea.top || '0px'));
+      root.style.setProperty('--ai-phone-app-safe-right', String(safeArea.right || '0px'));
+      root.style.setProperty('--ai-phone-app-safe-bottom', String(safeArea.bottom || '0px'));
+      root.style.setProperty('--ai-phone-app-safe-left', String(safeArea.left || '0px'));
+      root.style.setProperty('--ai-phone-app-bar-top', String(safeArea.barTop || '0px'));
+      root.style.setProperty('--ai-phone-app-bar-height', String(safeArea.barHeight || '0px'));
+      root.style.setProperty('--ai-phone-app-bar-clear-left', String(safeArea.barClearLeft || '0px'));
+      root.style.setProperty('--ai-phone-app-bar-clear-right', String(safeArea.barClearRight || '0px'));
+      window.dispatchEvent(new CustomEvent('aiphone:safe-area-change', { detail: safeArea }));
+      return;
+    }
     if (data.type === 'tool.invoke' && data.toolRequestId) {
       var handlerKey = String(data.handler || data.toolId || data.toolName || '').trim();
       var handler = toolHandlers[handlerKey] || toolHandlers[String(data.toolId || '')] || toolHandlers[String(data.toolName || '')];
@@ -280,6 +377,8 @@ html, body { min-height: 100%; }
       readProfiles: function(payload){ return request('voice.readProfiles', payload || {}); },
       tts: function(payload){ return request('voice.tts', payload || {}); },
       stt: function(payload){ return request('voice.stt', payload || {}); },
+      record: function(payload){ return request('voice.record', payload || {}); },
+      stopRecord: function(payload){ return request('voice.stopRecord', payload || {}); },
       clone: function(payload){ return request('voice.clone', payload || {}); },
       play: function(payload){ return request('voice.play', payload || {}); },
       stopPlayback: function(payload){ return request('voice.stopPlayback', payload || {}); },
@@ -312,6 +411,11 @@ html, body { min-height: 100%; }
       get: function(payload){ return request('media.get', payload || {}); },
       revoke: function(payload){ return request('media.revoke', payload || {}); },
       delete: function(payload){ return request('media.delete', payload || {}); }
+    },
+    geo: {
+      get: function(payload){ return request('geo.get', payload || {}); },
+      watch: function(payload){ return request('geo.watch.start', payload || {}); },
+      clearWatch: function(){ return request('geo.watch.stop', {}); }
     },
     tools: {
       handle: function(name, handler){
@@ -382,6 +486,32 @@ html, body { min-height: 100%; }
     wallet: {
       get: function(){ return request('wallet.get'); },
       pay: function(payload){ return request('wallet.pay', payload || {}); }
+    },
+    bridge: {
+      send: function(payload){ return request('bridge.send', payload || {}); },
+      readState: function(payload){ return request('bridge.readState', payload || {}); }
+    },
+    room: {
+      create: function(payload){ return request('room.create', payload || {}); },
+      join: function(payload){ return request('room.join', payload || {}); },
+      current: function(){ return request('room.current'); },
+      send: function(payload){ return request('room.send', { payload: payload }); },
+      setState: function(state){ return request('room.setState', { state: state }); },
+      getState: function(){ return request('room.getState'); },
+      players: function(){ return request('room.players'); },
+      kick: function(userId){ return request('room.kick', { userId: userId }); },
+      close: function(){ return request('room.close'); },
+      leave: function(){ return request('room.leave'); },
+      report: function(reason){ return request('room.report', { reason: reason }); }
+    },
+    cloud: {
+      put: function(payload){ return request('cloud.put', payload || {}); },
+      get: function(payload){ return request('cloud.get', typeof payload === 'string' ? { id: payload } : (payload || {})); },
+      list: function(payload){ return request('cloud.list', payload || {}); },
+      update: function(payload){ return request('cloud.update', payload || {}); },
+      delete: function(payload){ return request('cloud.delete', typeof payload === 'string' ? { id: payload } : (payload || {})); },
+      takeRandom: function(payload){ return request('cloud.takeRandom', payload || {}); },
+      report: function(payload){ return request('cloud.report', payload || {}); }
     },
     memory: {
       readCore: function(payload){ return request('memory.readCore', payload || {}); },
@@ -522,6 +652,7 @@ function bridgeActionNeedsSettingsStorage(action: string): boolean {
 
 function bridgeActionNeedsKvStorage(action: string): boolean {
   return action.startsWith("db.")
+    || action.startsWith("bridge.")
     || action.startsWith("notifications.")
     || action.startsWith("tasks.")
     || action.startsWith("wallet.")
@@ -677,6 +808,7 @@ export function CustomAppRunner({
 }: CustomAppRunnerProps) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const subscribedEventsRef = useRef<Set<string>>(new Set());
+  const geoWatchIdRef = useRef<number | null>(null);
   const backgroundEventSentRef = useRef(false);
   const backgroundEventCompletedRef = useRef(false);
   const backgroundToolSentRef = useRef(false);
@@ -688,11 +820,49 @@ export function CustomAppRunner({
   const registeredToolHandlersRef = useRef<Set<string>>(new Set());
   const frameAudioChannelsRef = useRef<Map<string, FrameAudioChannel>>(new Map());
   const frameObjectUrlsRef = useRef<Set<string>>(new Set());
+  const onlineRoomRef = useRef<OnlineRoomConnection | null>(null);
+
+  // 联机房间随 APP 生命周期走：关 APP 即退房（房主退房 = 关房）
+  useEffect(() => () => {
+    onlineRoomRef.current?.leave();
+    onlineRoomRef.current = null;
+  }, []);
   const [frameId] = useState(() => `custom_app_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
   const [bridgeReady, setBridgeReady] = useState(false);
+  // 应用首屏什么都没画出来时由 iframe 上报（见注入脚本里的 app.blank）
+  const [frameFailure, setFrameFailure] = useState<CustomAppFailureDetail | null>(null);
   const isBackgroundRunner = Boolean(backgroundEvent || backgroundTool);
   const effectiveEmbedded = embedded || isBackgroundRunner;
   const srcDoc = useMemo(() => createCustomAppSrcDoc(app, frameId, launchContext, effectiveEmbedded), [app, frameId, launchContext, effectiveEmbedded]);
+  const syncHostedSafeArea = useCallback(() => {
+    const frame = iframeRef.current;
+    if (!frame) return;
+    // 实测胶囊按钮（菜单/关闭）几何：top 取其下沿（整体让位的保守值），
+    // bar* 取整行位置和右侧水平占位（供想与胶囊同排摆按钮的应用贴行对齐）。
+    // 元素不在（如嵌入模式）时退回 getPwaHostedSafeArea 的估算值。
+    // 下沿之后只留 4px：这段间隙与胶囊自身的 top 偏移是同一处留白的两半，
+    // 各留 8px 会叠成一整条，存量 APP（都吃 safe-top）的顶栏被整体推下去。
+    let measured;
+    const capsule = frame.parentElement?.querySelector(".custom-app-runner-capsule");
+    if (capsule) {
+      const capsuleRect = capsule.getBoundingClientRect();
+      const frameRect = frame.getBoundingClientRect();
+      if (capsuleRect.height > 0) {
+        measured = {
+          topPx: capsuleRect.bottom - frameRect.top + 4,
+          barTopPx: capsuleRect.top - frameRect.top,
+          barHeightPx: capsuleRect.height,
+          barClearRightPx: frameRect.right - capsuleRect.left + 8,
+        };
+      }
+    }
+    frame.contentWindow?.postMessage({
+      source: "ai-phone-custom-app-host",
+      type: "layout.safe-area",
+      frameId,
+      safeArea: getPwaHostedSafeArea("custom-app", effectiveEmbedded, measured),
+    }, "*");
+  }, [effectiveEmbedded, frameId]);
   const declaredEvents = useMemo(() => getCustomAppDeclaredEventNames(app), [app]);
   const declaredToolKeys = useMemo(() => getCustomAppDeclaredToolKeys(app), [app]);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -703,6 +873,17 @@ export function CustomAppRunner({
   const closeLabel = launchSource === "chat_plus_action" || launchSource === "chat_card" || launchSource === "chat_directive"
     ? "返回聊天室"
     : "返回桌面";
+
+  useEffect(() => {
+    window.addEventListener(PWA_DISPLAY_MODE_CHANGED_EVENT, syncHostedSafeArea);
+    document.addEventListener("fullscreenchange", syncHostedSafeArea);
+    window.addEventListener("pageshow", syncHostedSafeArea);
+    return () => {
+      window.removeEventListener(PWA_DISPLAY_MODE_CHANGED_EVENT, syncHostedSafeArea);
+      document.removeEventListener("fullscreenchange", syncHostedSafeArea);
+      window.removeEventListener("pageshow", syncHostedSafeArea);
+    };
+  }, [syncHostedSafeArea]);
 
   const getFrameAudioChannel = useCallback((name: string): FrameAudioChannel => {
     let entry = frameAudioChannelsRef.current.get(name);
@@ -808,6 +989,14 @@ export function CustomAppRunner({
     }, "*");
   }, [backgroundEvent, frameId]);
 
+  // APP 关闭/卸载运行器时停掉定位监听，避免后台白耗电
+  useEffect(() => () => {
+    if (geoWatchIdRef.current != null && typeof navigator !== "undefined" && navigator.geolocation) {
+      navigator.geolocation.clearWatch(geoWatchIdRef.current);
+    }
+    geoWatchIdRef.current = null;
+  }, []);
+
   const postHostEvent = useCallback((eventName: string, payload: Record<string, unknown>) => {
     if (!subscribedEventsRef.current.has(eventName) && !subscribedEventsRef.current.has("*")) return;
     iframeRef.current?.contentWindow?.postMessage({
@@ -893,7 +1082,7 @@ export function CustomAppRunner({
           ai: ["generate", "chat", "embed", "classify"],
           user: ["getProfile", "getPersona", "getPreferences"],
           network: ["fetch"],
-          voice: ["readProfiles", "tts", "stt", "clone", "play", "stopPlayback", "pausePlayback", "resumePlayback"],
+          voice: ["readProfiles", "tts", "stt", "record", "stopRecord", "clone", "play", "stopPlayback", "pausePlayback", "resumePlayback"],
           calendar: ["read", "list", "write", "create", "update", "delete", "replaceWeek"],
           world: ["read", "list", "get", "write", "create", "update", "delete", "activate"],
           media: ["pick", "save", "put", "get", "revoke", "delete"],
@@ -903,6 +1092,8 @@ export function CustomAppRunner({
           notifications: ["create", "list", "markRead", "markAllRead", "getBadge", "setBadge", "incrementBadge", "clearBadge"],
           tasks: ["schedule", "list", "cancel"],
           wallet: ["get", "pay"],
+          bridge: ["send", "readState"],
+          geo: ["get", "watch", "clearWatch"],
         },
       };
     }
@@ -990,6 +1181,129 @@ export function CustomAppRunner({
         sourceEngine: "custom_app",
       });
       return result ?? { name, success: false, error: "工具没有返回结果。" };
+    }
+
+    if (action.startsWith("room.") || action.startsWith("cloud.")) {
+      requirePermission("online.play");
+      const namespace = `custom_app:${app.id}`;
+
+      if (action.startsWith("cloud.")) {
+        const cloudAction = action.slice("cloud.".length);
+        if (cloudAction === "report") {
+          const reportId = String(record.id ?? "").trim();
+          if (!reportId) throw new Error("cloud.report 缺少 id。");
+          await submitContentReport({
+            contentType: "online_doc",
+            contentId: reportId,
+            reason: String(record.reason ?? "").slice(0, 500),
+          });
+          return true;
+        }
+        if (!["put", "get", "list", "update", "delete", "takeRandom"].includes(cloudAction)) {
+          throw new Error(`未知云端动作：${action}`);
+        }
+        const response = await onlineCloudApi({
+          action: cloudAction,
+          namespace,
+          collection: record.collection,
+          id: record.id,
+          data: record.data,
+          sortKey: record.sortKey,
+          limit: record.limit,
+          mine: record.mine,
+          orderBy: record.orderBy,
+        });
+        if (cloudAction === "list") return response.docs;
+        if (cloudAction === "delete") return { deleted: response.deleted === true };
+        return response.doc ?? null;
+      }
+
+      const publicRoomInfo = (connection: OnlineRoomConnection) => ({
+        id: connection.info.id,
+        code: connection.info.code,
+        title: connection.info.title,
+        maxPlayers: connection.info.maxPlayers,
+        meta: connection.info.meta,
+        hostUserId: connection.info.hostUserId,
+        hostName: connection.info.hostName,
+        isHost: connection.info.isHost,
+        selfUserId: connection.selfUserId,
+        selfName: connection.selfName,
+        players: connection.players(),
+      });
+      const current = onlineRoomRef.current && !onlineRoomRef.current.isClosed ? onlineRoomRef.current : null;
+
+      if (action === "room.create" || action === "room.join") {
+        if (current) {
+          current.leave();
+          onlineRoomRef.current = null;
+        }
+        const events = {
+          onMessage: (message: { from: { userId: string; name: string }; payload: unknown; sentAt: number }) => {
+            postHostEvent("room.message", { from: message.from, payload: message.payload, sentAt: message.sentAt });
+          },
+          onPlayers: (players: unknown[]) => postHostEvent("room.players", { players }),
+          onState: (state: Record<string, unknown>) => postHostEvent("room.state", { state }),
+          onClosed: (reason: string) => {
+            onlineRoomRef.current = null;
+            postHostEvent("room.closed", { reason });
+          },
+        };
+        const connection = action === "room.create"
+          ? await OnlineRoomConnection.create({
+            namespace,
+            title: typeof record.title === "string" ? record.title : "",
+            maxPlayers: Number(record.maxPlayers ?? 8) || 8,
+            meta: record.meta && typeof record.meta === "object" && !Array.isArray(record.meta)
+              ? record.meta as Record<string, unknown>
+              : {},
+          }, events)
+          : await OnlineRoomConnection.join({ namespace, code: String(record.code ?? "") }, events);
+        onlineRoomRef.current = connection;
+        return publicRoomInfo(connection);
+      }
+
+      if (action === "room.current") {
+        return current ? { ...publicRoomInfo(current), state: current.state() } : null;
+      }
+      if (action === "room.leave") {
+        if (current) {
+          current.leave();
+          onlineRoomRef.current = null;
+        }
+        return true;
+      }
+      if (!current) throw new Error("当前没有已连接的联机房间，请先 room.create 或 room.join。");
+      if (action === "room.report") {
+        await submitContentReport({
+          contentType: "online_room",
+          contentId: current.info.id,
+          reason: String(record.reason ?? "").slice(0, 500),
+        });
+        return true;
+      }
+      if (action === "room.send") {
+        await current.send(record.payload ?? record.data ?? record.message ?? null);
+        return true;
+      }
+      if (action === "room.setState") {
+        const state = record.state ?? record.data;
+        if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("room.setState 需要对象 state。");
+        await current.setState(state as Record<string, unknown>);
+        return true;
+      }
+      if (action === "room.getState") return current.state();
+      if (action === "room.players") return current.players();
+      if (action === "room.kick") {
+        await current.kick(String(record.userId ?? ""));
+        return true;
+      }
+      if (action === "room.close") {
+        await current.close();
+        onlineRoomRef.current = null;
+        return true;
+      }
+      throw new Error(`未知联机动作：${action}`);
     }
 
     if (action.startsWith("db.")) {
@@ -1202,6 +1516,16 @@ export function CustomAppRunner({
       requirePermission("voice.stt");
       return recognizeCustomAppSpeech(app, record);
     }
+    // 录一段麦克风音频回传给 APP。沿用 voice.stt 权限:两者都是「听麦克风」,
+    // 装应用时那一条授权说明已经覆盖了麦克风采集。
+    if (action === "voice.record") {
+      requirePermission("voice.stt");
+      return recordCustomAppSpeech(record);
+    }
+    if (action === "voice.stopRecord") {
+      requirePermission("voice.stt");
+      return stopCustomAppRecording();
+    }
     if (action === "voice.clone") {
       requirePermission("voice.clone");
       return cloneCustomAppVoice(app, record);
@@ -1236,6 +1560,56 @@ export function CustomAppRunner({
     if (action === "media.save") {
       requirePermission("media.save");
       return saveCustomAppMedia(record);
+    }
+
+    // 定位：沙盒 iframe 是不透明源拿不到 navigator.geolocation 权限，由宿主页面代理
+    if (action === "geo.get") {
+      requirePermission("geo.read");
+      return new Promise((resolve, reject) => {
+        if (typeof navigator === "undefined" || !navigator.geolocation) {
+          reject(new Error("当前设备或环境不支持定位。"));
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+            timestamp: pos.timestamp,
+          }),
+          err => reject(new Error(err?.message ? `定位失败：${err.message}` : "定位失败或未授权。")),
+          {
+            enableHighAccuracy: record.highAccuracy !== false,
+            timeout: Math.min(30000, Math.max(1000, Number(record.timeoutMs) || 10000)),
+            maximumAge: Math.max(0, Number(record.maximumAgeMs) || 30000),
+          },
+        );
+      });
+    }
+    if (action === "geo.watch.start") {
+      requirePermission("geo.watch");
+      if (typeof navigator === "undefined" || !navigator.geolocation) {
+        throw new Error("当前设备或环境不支持定位。");
+      }
+      if (geoWatchIdRef.current != null) navigator.geolocation.clearWatch(geoWatchIdRef.current);
+      geoWatchIdRef.current = navigator.geolocation.watchPosition(
+        pos => postHostEvent("geo.position", {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          timestamp: pos.timestamp,
+        }),
+        err => postHostEvent("geo.error", { message: err?.message ?? "定位失败" }),
+        { enableHighAccuracy: record.highAccuracy !== false, maximumAge: Math.max(0, Number(record.maximumAgeMs) || 5000) },
+      );
+      return { ok: true };
+    }
+    if (action === "geo.watch.stop") {
+      if (geoWatchIdRef.current != null && typeof navigator !== "undefined" && navigator.geolocation) {
+        navigator.geolocation.clearWatch(geoWatchIdRef.current);
+      }
+      geoWatchIdRef.current = null;
+      return true;
     }
 
     if (action === "characters.list") {
@@ -1456,6 +1830,15 @@ export function CustomAppRunner({
       return cancelCustomAppTask(app.id, String(record.id ?? ""));
     }
 
+    if (action === "bridge.send") {
+      requirePermission("bridge.send");
+      return sendCustomAppBridgeOutbox(record);
+    }
+    if (action === "bridge.readState") {
+      requirePermission("bridge.read");
+      return readCustomAppBridgeState(record);
+    }
+
     if (action === "wallet.get") {
       requirePermission("wallet.read");
       return getWalletSnapshot();
@@ -1485,6 +1868,25 @@ export function CustomAppRunner({
     };
     window.addEventListener(CHAT_MESSAGE_PUSHED_EVENT, handleChatMessagePushed);
     return () => window.removeEventListener(CHAT_MESSAGE_PUSHED_EVENT, handleChatMessagePushed);
+  }, [app, isBackgroundRunner, postHostEvent]);
+
+  // 现实桥 bridge.data 事件·前台通道：APP 正打开时直接投递给 iframe
+  //（后台拉起由 desktop-shell 的广播监听负责，那边会跳过正在前台的 APP）
+  useEffect(() => {
+    if (isBackgroundRunner) return undefined;
+    const handleBridgeData = (event: Event) => {
+      if (!subscribedEventsRef.current.has(REALITY_BRIDGE_APP_EVENT_NAME) && !subscribedEventsRef.current.has("*")) return;
+      const detail = (event as CustomEvent<Record<string, unknown>>).detail;
+      if (!detail || typeof detail !== "object") return;
+      postHostEvent(REALITY_BRIDGE_APP_EVENT_NAME, {
+        type: String(detail.type ?? ""),
+        payload: String(detail.payload ?? ""),
+        processed: String(detail.processed ?? ""),
+        receivedAt: String(detail.receivedAt ?? new Date().toISOString()),
+      });
+    };
+    window.addEventListener(REALITY_BRIDGE_DATA_EVENT, handleBridgeData);
+    return () => window.removeEventListener(REALITY_BRIDGE_DATA_EVENT, handleBridgeData);
   }, [app, isBackgroundRunner, postHostEvent]);
 
   useEffect(() => {
@@ -1543,6 +1945,20 @@ export function CustomAppRunner({
         });
         return;
       }
+      if (record.type === "app.blank") {
+        // 后台跑批的 runner 本来就不出界面，不弹面板
+        if (isBackgroundRunner) return;
+        const errors = Array.isArray(record.errors) ? record.errors.map(item => String(item)).filter(Boolean) : [];
+        setFrameFailure({
+          source: "app",
+          appName: app.name,
+          appId: app.id,
+          appVersion: app.version,
+          manifestId: app.manifest?.id,
+          errors,
+        });
+        return;
+      }
       if (record.type === "tool.result") {
         const toolRequestId = String(record.toolRequestId ?? "");
         const pending = pendingToolInvocationsRef.current.get(toolRequestId);
@@ -1565,7 +1981,10 @@ export function CustomAppRunner({
     return () => {
       window.removeEventListener("message", handleMessage);
     };
-  }, [backgroundEvent, completeBackgroundEvent, frameId, handleBridgeRequest, postResponse]);
+  }, [app, backgroundEvent, completeBackgroundEvent, frameId, handleBridgeRequest, isBackgroundRunner, postResponse]);
+
+  // 换应用/重开 iframe 时清掉上一次的失败态
+  useEffect(() => { setFrameFailure(null); }, [srcDoc]);
 
   return (
     <div className={`custom-app-runner${embedded ? " custom-app-runner-embedded" : ""}`}>
@@ -1580,14 +1999,30 @@ export function CustomAppRunner({
           </button>
         </div>
       ) : null}
-      <iframe
-        ref={iframeRef}
-        title={app.name}
-        className="custom-app-runner-frame"
-        sandbox="allow-scripts allow-downloads"
-        allow="autoplay"
-        srcDoc={bridgeReady ? srcDoc : EMPTY_CUSTOM_APP_SRC_DOC}
-      />
+      {bridgeReady ? (
+        // Chromium can leave a sandboxed about:srcdoc document with a 0x0 layout tree
+        // when the same iframe first loads an empty srcDoc and is immediately navigated
+        // to the real app. Mount it only after the host listener is ready so the final
+        // document is the iframe's first and only srcDoc navigation.
+        <iframe
+          ref={iframeRef}
+          title={app.name}
+          className="custom-app-runner-frame"
+          sandbox="allow-scripts allow-downloads"
+          allow="autoplay"
+          onLoad={syncHostedSafeArea}
+          srcDoc={srcDoc}
+        />
+      ) : null}
+
+      {frameFailure ? (
+        <CustomAppFailurePanel
+          detail={frameFailure}
+          closeLabel={closeLabel}
+          onClose={onClose}
+          onDismiss={() => setFrameFailure(null)}
+        />
+      ) : null}
 
       {menuOpen ? (
         <div className="app-market-overlay app-market-drawer-overlay" role="presentation" onClick={() => setMenuOpen(false)}>

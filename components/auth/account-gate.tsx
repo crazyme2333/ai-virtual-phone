@@ -4,8 +4,9 @@ import { useEffect, useState, type CSSProperties, type FormEvent, type ReactNode
 import { Loader2, LogIn } from "lucide-react";
 
 import { AccountProvider } from "@/lib/account-context";
-import { ACCOUNT_NETWORK_ERROR, fetchCurrentAccount, loginAccount, logoutAccount, type AccountProfile } from "@/lib/account-client";
+import { ACCOUNT_NETWORK_ERROR, fetchCurrentAccount, loginAccount, logoutAccount, saveActiveAccountId, type AccountProfile } from "@/lib/account-client";
 import { isSelfHostedModeEnabled } from "@/lib/self-hosting";
+import { VERIFY_APPLICATIONS_CLOSED_MESSAGE, VERIFY_APPLICATIONS_OPEN } from "@/lib/verification-availability";
 
 type AccountGateProps = {
   children: ReactNode;
@@ -51,6 +52,7 @@ export function AccountGate({ children }: AccountGateProps) {
   async function refreshAccount() {
     if (selfHostedMode) {
       setAccount(SELF_HOSTED_ACCOUNT);
+      saveActiveAccountId(SELF_HOSTED_ACCOUNT.id);
       setStatus("ready");
       setError("");
       return;
@@ -64,6 +66,8 @@ export function AccountGate({ children }: AccountGateProps) {
     }
     if (result.ok && result.account) {
       setAccount(result.account);
+      // 按账号隔离的本地缓存据此判定归属，账号一解析出来就落一份
+      saveActiveAccountId(result.account.id);
       setStatus("ready");
       setError("");
       return;
@@ -74,6 +78,7 @@ export function AccountGate({ children }: AccountGateProps) {
       return;
     }
     setAccount(null);
+    saveActiveAccountId("");
     setStatus("signed-out");
     if (result.error && !/账号状态读取失败/.test(result.error)) setError(result.error);
   }
@@ -81,6 +86,7 @@ export function AccountGate({ children }: AccountGateProps) {
   useEffect(() => {
     if (selfHostedMode) {
       setAccount(SELF_HOSTED_ACCOUNT);
+      saveActiveAccountId(SELF_HOSTED_ACCOUNT.id);
       setStatus("ready");
       setError("");
       return;
@@ -128,12 +134,14 @@ export function AccountGate({ children }: AccountGateProps) {
   async function handleLogout() {
     if (selfHostedMode) {
       setAccount(SELF_HOSTED_ACCOUNT);
+      saveActiveAccountId(SELF_HOSTED_ACCOUNT.id);
       setStatus("ready");
       return;
     }
 
     await logoutAccount();
     setAccount(null);
+    saveActiveAccountId("");
     setStatus("signed-out");
   }
 
@@ -213,9 +221,15 @@ export function AccountGate({ children }: AccountGateProps) {
               inputMode="text"
               placeholder="首次使用该账号时填写"
             />
-            <a className="account-gate-verify-link" href="/verify" target="_blank" rel="noreferrer">
-              没有激活码？申请内测资格 →
-            </a>
+            {VERIFY_APPLICATIONS_OPEN ? (
+              <a className="account-gate-verify-link" href="/verify" target="_blank" rel="noreferrer">
+                没有激活码？申请访问资格 →
+              </a>
+            ) : (
+              <span className="account-gate-verify-link" aria-disabled="true">
+                {VERIFY_APPLICATIONS_CLOSED_MESSAGE}
+              </span>
+            )}
           </label>
           {error ? <div className="account-gate-error" role="alert">{error}</div> : null}
           <button type="submit" disabled={busy}>
