@@ -1,0 +1,22 @@
+name: Sync Test Branch with Upstream
+
+on:
+  schedule:
+    # 每天UTC时间0点30分运行一次
+    - cron: '30 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Sync with upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          target_sync_branch: test
+          upstream_sync_repo: xiaolongbao0709/ai-virtual-phone
+          upstream_sync_branch: test
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
